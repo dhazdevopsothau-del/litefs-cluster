@@ -8,7 +8,7 @@ CONSUL_HTTP="http://127.0.0.1:8500"
 LOG_P="[BOOTSTRAP]"
 
 log()  { echo "$LOG_P [$(date '+%H:%M:%S')] $*"; }
-info() { echo "$LOG_P [INFO]  $*"; }
+info() { echo "$LOG_P [INFO]  $*" >&2; }
 err()  { echo "$LOG_P [ERROR] $*" >&2; }
 
 # ── 1. Chờ Tailscale có IP ────────────────────────────────────────────────────
@@ -166,7 +166,8 @@ main() {
     local peer=""
     local attempt
     for attempt in 1 2; do
-        peer=$(find_active_peer 2>/dev/null || true)
+        # SAU — bỏ 2>/dev/null để info() ra stderr hiển thị, stdout chỉ có IP
+        peer=$(find_active_peer || true)
         [ -n "$peer" ] && break
         if [ $attempt -lt 2 ]; then
             log "Peer check attempt $attempt failed. Retry in 8s..."
