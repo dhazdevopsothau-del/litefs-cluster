@@ -1,0 +1,117 @@
+name: "LiteFS Node C"
+
+on:
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: litefs-node
+  CONTAINER_NAME: litefs-node-c
+
+jobs:
+  run-node:
+    name: "Node C — Run & Monitor + Failover Test"
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -f docker/Dockerfile -t $IMAGE_NAME:latest .
+          echo "✓ Image built"
+
+      - name: Start Node C container
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          NODE_NAME="node-c-${{ github.run_number }}"
+          echo "NODE_NAME=$NODE_NAME" >> $GITHUB_ENV
+
+          docker run -d \
+            --name "$CONTAINER_NAME" \
+            --privileged \
+            --env TS_AUTHKEY="$TS_AUTHKEY" \
+            --env TS_TAGS="tag:litefs-node" \
+            --env NODE_NAME="$NODE_NAME" \
+            $IMAGE_NAME:latest
+
+          echo "✓ Container started: $CONTAINER_NAME (node: $NODE_NAME)"
+
+      - name: "Wait for bootstrap (75s)"
+        run: |
+          echo "Waiting 75s..."
+          for i in $(seq 1 15); do
+            sleep 5
+            echo -n "  ${i}0s... "
+            docker exec $CONTAINER_NAME curl -sf http://localhost:8500/v1/status/leader \
+              2>/dev/null && echo "OK" || echo "waiting"
+          done
+
+      - name: Show bootstrap logs
+        if: always()
+        run: docker logs $CONTAINER_NAME 2>&1 | tail -60
+
+      - name: "Verify 1: Full cluster (all 3 nodes should be visible)"
+        run: |
+          echo "=== Node C Initial Verification ==="
+          docker exec $CONTAINER_NAME /usr/local/bin/verify.sh
+          echo ""
+          echo "NOTE: If A and B are running, you should see 3 members above."
+
+      - name: "Keep node alive (20 min)"
+        run: |
+          # Node C chạy 20 phút (thường sau khi A đã stop)
+          # → Chứng minh B và C tiếp tục hoạt động sau khi A (leader cũ) down
+          echo "Node C will run for 20 minutes..."
+          for i in $(seq 1 20); do
+            echo ""
+            echo "══════════════════════════════════════════"
+            echo " Node C — Minute $i/20 — $(date -u '+%H:%M:%S UTC')"
+            echo "══════════════════════════════════════════"
+
+            echo "--- Consul members (watch for changes when A stops) ---"
+            docker exec $CONTAINER_NAME consul members 2>/dev/null || echo "unreachable"
+
+            echo "--- Current Consul RAFT leader ---"
+            LEADER=$(docker exec $CONTAINER_NAME curl -s http://localhost:8500/v1/status/leader \
+              2>/dev/null || echo "?")
+            echo "  Leader: $LEADER"
+
+            echo "--- LiteFS primary ---"
+            LITEFS_PRIMARY=$(docker exec $CONTAINER_NAME consul kv get litefs/primary \
+              2>/dev/null || echo "not set")
+            echo "  $LITEFS_PRIMARY"
+
+            echo "--- DB heartbeat writers ---"
+            docker exec $CONTAINER_NAME sqlite3 /mnt/litefs/cluster.db \
+              "SELECT node_name, COUNT(*) as writes, MAX(ts) as last FROM heartbeats GROUP BY node_ip;" \
+              2>/dev/null || echo "(N/A)"
+
+            sleep 60
+          done
+
+      - name: "Verify final: Failover proof"
+        if: always()
+        run: |
+          echo "=== FINAL STATE AFTER POSSIBLE FAILOVER ==="
+          docker exec $CONTAINER_NAME /usr/local/bin/verify.sh || true
+
+          echo ""
+          echo "=== FAILOVER EVIDENCE ==="
+          echo "If node-a is gone but heartbeats continue → failover worked:"
+          docker exec $CONTAINER_NAME sqlite3 /mnt/litefs/cluster.db \
+            "SELECT node_name, node_ip, COUNT(*) as writes, MIN(ts) as first, MAX(ts) as last
+             FROM heartbeats GROUP BY node_ip ORDER BY first;" \
+            2>/dev/null || true
+
+      - name: "Graceful shutdown"
+        if: always()
+        run: |
+          docker stop --time=20 $CONTAINER_NAME || true
+          echo "✓ Node C stopped"
+
+      - name: Show final logs
+        if: always()
+        run: docker logs $CONTAINER_NAME 2>&1 | tail -30 || true

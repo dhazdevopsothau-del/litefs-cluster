@@ -1,0 +1,130 @@
+name: "LiteFS Node A"
+
+on:
+  workflow_dispatch:   # Kích hoạt thủ công
+  # push:
+  #   branches: [main]  # Uncomment nếu muốn auto-trigger
+
+env:
+  IMAGE_NAME: litefs-node
+  CONTAINER_NAME: litefs-node-a
+
+jobs:
+  run-node:
+    name: "Node A — Run & Monitor"
+    runs-on: ubuntu-latest
+    timeout-minutes: 50  # Hard limit an toàn
+
+    steps:
+      # ── Setup ────────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Build image ───────────────────────────────────────────────────────────
+      - name: Build Docker image
+        run: |
+          echo "=== Building Docker image ==="
+          docker build \
+            -f docker/Dockerfile \
+            -t $IMAGE_NAME:latest \
+            .
+          echo "✓ Image built"
+
+      # ── Start container ───────────────────────────────────────────────────────
+      - name: Start Node A container
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          # NODE_NAME phải unique trên Tailscale network
+          # Dùng run_number + job name để đảm bảo unique
+          NODE_NAME="node-a-${{ github.run_number }}"
+          echo "NODE_NAME=$NODE_NAME" >> $GITHUB_ENV
+
+          docker run -d \
+            --name "$CONTAINER_NAME" \
+            --privileged \
+            --env TS_AUTHKEY="$TS_AUTHKEY" \
+            --env TS_TAGS="tag:litefs-node" \
+            --env NODE_NAME="$NODE_NAME" \
+            $IMAGE_NAME:latest
+
+          echo "✓ Container started: $CONTAINER_NAME (node: $NODE_NAME)"
+
+      # ── Chờ bootstrap hoàn tất ────────────────────────────────────────────────
+      - name: "Wait for bootstrap (60s)"
+        run: |
+          echo "Waiting 60s for Tailscale + Consul + LiteFS to initialize..."
+          for i in $(seq 1 12); do
+            sleep 5
+            echo -n "  ${i}0s... "
+            # Quick health check
+            docker exec $CONTAINER_NAME curl -sf http://localhost:8500/v1/status/leader \
+              2>/dev/null && echo "Consul ready!" || echo "not yet"
+          done
+
+      # ── Show boot logs ────────────────────────────────────────────────────────
+      - name: Show bootstrap logs
+        if: always()
+        run: |
+          echo "=== Container logs ==="
+          docker logs $CONTAINER_NAME 2>&1 | tail -60
+
+      # ── Verify 1: Initial cluster state ──────────────────────────────────────
+      - name: "Verify 1: Initial cluster state"
+        run: |
+          echo "=== INITIAL VERIFICATION ==="
+          docker exec $CONTAINER_NAME /usr/local/bin/verify.sh
+
+      # ── Keep alive loop ────────────────────────────────────────────────────────
+      # 35 vòng × 60s = 35 phút
+      # Tổng: ~2min build + 1min wait + 35min loop + buffer = ~40min < 50min limit
+      - name: "Keep node alive (35 min monitoring loop)"
+        run: |
+          echo "Node A will run for 35 minutes..."
+          for i in $(seq 1 35); do
+            echo ""
+            echo "══════════════════════════════════════════"
+            echo " Node A — Minute $i/35 — $(date -u '+%H:%M:%S UTC')"
+            echo "══════════════════════════════════════════"
+
+            # Consul cluster state
+            echo "--- Consul members ---"
+            docker exec $CONTAINER_NAME consul members 2>/dev/null || echo "Consul unreachable"
+
+            # LiteFS primary
+            echo "--- LiteFS primary ---"
+            docker exec $CONTAINER_NAME consul kv get litefs/primary 2>/dev/null || echo "(not set)"
+
+            # DB stats
+            echo "--- DB heartbeats ---"
+            docker exec $CONTAINER_NAME sqlite3 /mnt/litefs/cluster.db \
+              "SELECT node_name, COUNT(*) as count FROM heartbeats GROUP BY node_name;" \
+              2>/dev/null || echo "(DB not accessible)"
+
+            sleep 60
+          done
+
+      # ── Final verify trước khi shutdown ──────────────────────────────────────
+      - name: "Verify final: Full cluster report"
+        if: always()
+        run: |
+          echo "=== FINAL VERIFICATION BEFORE SHUTDOWN ==="
+          docker exec $CONTAINER_NAME /usr/local/bin/verify.sh || true
+
+      # ── Graceful shutdown ──────────────────────────────────────────────────────
+      - name: "Graceful shutdown (consul leave)"
+        if: always()
+        run: |
+          echo "=== GRACEFUL SHUTDOWN ==="
+          echo "Sending SIGTERM (triggers consul leave in container)..."
+          # docker stop gửi SIGTERM → entrypoint trap → consul leave → exit
+          docker stop --time=20 $CONTAINER_NAME || true
+          echo "✓ Node A stopped gracefully"
+          echo ""
+          echo "Remaining cluster should re-elect leader automatically."
+
+      # ── Show final logs ───────────────────────────────────────────────────────
+      - name: Show final container logs
+        if: always()
+        run: |
+          docker logs $CONTAINER_NAME 2>&1 | tail -30 || true
